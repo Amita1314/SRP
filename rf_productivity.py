@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-rf_productivity.py — Random Forest: Strike Productivity Prediction
+rf_productivity.py — Random Forest: Whale Strike Productivity
 
-Predicts whether an active whaling attempt results in a Strike (vs Sight/Spoke).
-Filter: cluster_active >= 0 (active hunting on a named whaling ground, 68,585 rows).
-Split:  80/20 by VoyageID (GroupShuffleSplit) to prevent voyage-level leakage.
+Predicts whether any ship-day observation results in a Strike.
+Full 477k dataset. Grounds assigned by direct HDBSCAN label (68k rows)
+or nearest centroid (408k rows). 80/20 VoyageID-grouped split.
 """
 import json
 import os
@@ -22,8 +22,6 @@ from sklearn.model_selection import GroupShuffleSplit
 
 DB_PATH    = "whaling.db"
 OUTPUT_DIR = "output"
-
-# ── Ground cluster labels (unique names by centroid geography) ─────────────────
 
 GROUND_LABELS = {
     0:  "Hudson Bay",
@@ -110,19 +108,74 @@ def parse_enc_count(json_str, key):
         return 0
 
 
+def nearest_centroid(lats, lons, c_lats, c_lons):
+    """
+    Vectorized nearest-centroid by haversine proxy.
+    Returns integer index (0..51) of nearest centroid for each row.
+    Shape: lats/lons (n,), c_lats/c_lons (52,) → returns (n,) int array.
+    """
+    lat1 = np.radians(lats[:, None])
+    lon1 = np.radians(lons[:, None])
+    lat2 = np.radians(c_lats[None, :])
+    lon2 = np.radians(c_lons[None, :])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return np.argmin(a, axis=1)
+
+
 # ── Feature building ──────────────────────────────────────────────────────────
 
 def build_features(con):
-    print("Loading observations (cluster_active >= 0) ...")
+    print("Loading all valid observations ...")
     df = pd.read_sql_query(
         """SELECT id, VoyageID, cluster_active, cluster_fleet,
-                  Encounter, Year, Month, rig, tonnage
+                  Encounter, Year, Month, Lat, Lon, rig, tonnage
            FROM observations
-           WHERE cluster_active >= 0""",
+           WHERE Lat IS NOT NULL AND Lon IS NOT NULL AND Year IS NOT NULL
+             AND Lat BETWEEN -90 AND 90""",
         con,
     ).reset_index(drop=True)
+    # Fix antimeridian
+    df.loc[df["Lon"] < -180, "Lon"] += 360
+    df = df[df["Lon"].between(-180, 180)].reset_index(drop=True)
     n0 = len(df)
     print(f"  {n0:,} rows")
+
+    # ── Ground assignment ─────────────────────────────────────────────────────
+    print("  Assigning grounds ...")
+    centroids = pd.read_sql_query(
+        "SELECT cluster, lat_centroid, lon_centroid FROM cluster_summary_active ORDER BY cluster",
+        con,
+    )
+    c_lats = centroids["lat_centroid"].values
+    c_lons = centroids["lon_centroid"].values
+    c_ids  = centroids["cluster"].values      # should be 0..51
+
+    ground_id = df["cluster_active"].fillna(-1).astype(int).values.copy()
+    need_centroid = ground_id < 0
+    print(f"    Direct ground: {(~need_centroid).sum():,}  "
+          f"Nearest centroid: {need_centroid.sum():,}")
+
+    # Nearest centroid for unassigned rows
+    nc_idx = nearest_centroid(
+        df.loc[need_centroid, "Lat"].values,
+        df.loc[need_centroid, "Lon"].values,
+        c_lats, c_lons,
+    )
+    ground_id[need_centroid] = c_ids[nc_idx]
+    df["ground_id"] = ground_id
+    df["ground_label"] = df["ground_id"].map(GROUND_LABELS)
+
+    ground_dummies = pd.get_dummies(df["ground_label"], prefix="gnd")
+    # Ensure all 52 columns present (some may be absent if split unlucky)
+    for lbl in GROUND_LABELS.values():
+        col = f"gnd_{lbl}"
+        if col not in ground_dummies.columns:
+            ground_dummies[col] = 0
+    ground_dummies = ground_dummies.reindex(
+        sorted(ground_dummies.columns), axis=1
+    )
 
     # ── Fleet events ──────────────────────────────────────────────────────────
     print("  Joining fleet features ...")
@@ -140,8 +193,7 @@ def build_features(con):
              "fleet_sight_count", "fleet_spoke_count"]]
 
     df = df.merge(fe, on="cluster_fleet", how="left")
-    assert len(df) == n0, "fleet merge changed row count"
-
+    assert len(df) == n0
     for col in ["fleet_n_vessels", "fleet_duration_days",
                 "fleet_sight_count", "fleet_spoke_count"]:
         df[col] = df[col].fillna(0)
@@ -153,7 +205,7 @@ def build_features(con):
         con,
     )
     df = df.merge(lf, on=["cluster_fleet", "VoyageID"], how="left")
-    assert len(df) == n0, "leader_follower merge changed row count"
+    assert len(df) == n0
     df["arrival_rank"] = df["arrival_rank"].fillna(0).astype(int)
     df["is_leader"]    = (df["arrival_rank"] == 1).astype(int)
 
@@ -169,7 +221,7 @@ def build_features(con):
                 .rename(columns={"n_consecutive_days": "convoy_max_days"}))
     conv_agg["convoy_member"] = 1
     df = df.merge(conv_agg, on="VoyageID", how="left")
-    assert len(df) == n0, "convoy merge changed row count"
+    assert len(df) == n0
     df["convoy_member"]   = df["convoy_member"].fillna(0).astype(int)
     df["convoy_max_days"] = df["convoy_max_days"].fillna(0).astype(int)
 
@@ -183,10 +235,6 @@ def build_features(con):
     df["tonnage_num"] = df["tonnage"].apply(parse_tonnage)
     df["tonnage_num"] = df["tonnage_num"].fillna(df["tonnage_num"].median())
     df["rig_enc"]     = df["rig"].apply(clean_rig).map(RIG_MAP)
-
-    # ── Ground label one-hot ──────────────────────────────────────────────────
-    df["ground_label"]  = df["cluster_active"].map(GROUND_LABELS)
-    ground_dummies      = pd.get_dummies(df["ground_label"], prefix="gnd")
 
     # ── Target ───────────────────────────────────────────────────────────────
     df["y"] = (df["Encounter"] == "Strike").astype(int)
@@ -227,11 +275,12 @@ def train_evaluate(df, X, y, groups):
     print(f"  Train: {len(X_train):,}  Test: {len(X_test):,}")
     print(f"  Train +rate: {y_train.mean():.1%}  Test +rate: {y_test.mean():.1%}")
 
-    print("\nTraining RandomForest (500 trees) ...")
+    print("\nTraining RandomForest (500 trees, class_weight=balanced) ...")
     rf = RandomForestClassifier(
         n_estimators=500,
         max_features="sqrt",
         min_samples_leaf=30,
+        class_weight="balanced",
         n_jobs=-1,
         random_state=42,
     )
@@ -254,7 +303,7 @@ def auroc_by_decade(df, test_idx, y_test, y_prob):
     results = {}
     for dec in sorted(set(decades)):
         mask = decades == dec
-        if mask.sum() < 30 or y_test[mask].sum() < 5:
+        if mask.sum() < 50 or y_test[mask].sum() < 5:
             continue
         try:
             results[int(dec)] = roc_auc_score(y_test[mask], y_prob[mask])
@@ -285,10 +334,10 @@ def plot_precision_recall(y_test, y_prob, outfile):
 
 
 def plot_feature_importance(rf, X_test, y_test, outfile):
-    print("  Computing permutation importance ...")
+    print("  Computing permutation importance (n_repeats=5) ...")
     result = permutation_importance(
         rf, X_test, y_test,
-        n_repeats=10,
+        n_repeats=5,
         random_state=42,
         n_jobs=-1,
         scoring="roc_auc",
