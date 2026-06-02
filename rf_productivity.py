@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-rf_productivity.py — Random Forest: Whale Strike Productivity
+rf_productivity.py — Random Forest: Inductive Exploration (Co-Duction Step 2)
 
-Predicts whether any ship-day observation results in a Strike.
-Full 477k dataset. Grounds assigned by direct HDBSCAN label (68k rows)
-or nearest centroid (408k rows). 80/20 VoyageID-grouped split.
+The RF is an exploration engine, not a prediction tool. All outputs (FI, SHAP
+direction, interaction effects) are computed on the 80% training partition only.
+The 20% holdout is saved pristine for regression hypothesis testing (Step 4).
 """
 import json
 import os
@@ -15,67 +15,42 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import shap
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.inspection import permutation_importance
-from sklearn.metrics import f1_score, precision_recall_curve, roc_auc_score
+from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupShuffleSplit
 
 DB_PATH    = "whaling.db"
 OUTPUT_DIR = "output"
 
 GROUND_LABELS = {
-    0:  "Hudson Bay",
-    1:  "Baja California",
-    2:  "Japan / Okhotsk",
-    3:  "Solomon Islands",
-    4:  "Gulf of Guinea",
-    5:  "S Atlantic (Tristan)",
-    6:  "Angola Atlantic",
-    7:  "Mid-Atlantic",
-    8:  "Hawaii Pacific",
-    9:  "Japan Sea",
-    10: "Brazil Atlantic",
-    11: "Equatorial Pacific",
-    12: "Caribbean",
-    13: "Gulf of Alaska",
-    14: "Madagascar",
-    15: "E Africa Indian Ocean",
-    16: "Gulf of Mexico",
-    17: "US East Coast",
-    18: "N Atlantic (Azores)",
-    19: "Equatorial Atlantic",
-    20: "N Pacific (Kamchatka)",
-    21: "Bering Sea (West)",
-    22: "Western Arctic",
-    23: "Bering Strait",
-    24: "Cape Verde (S)",
-    25: "Cape Verde (N)",
-    26: "Kamchatka / Okhotsk",
-    27: "Okhotsk Sea",
-    28: "Japan Ground (S)",
-    29: "Japan Ground (Main)",
-    30: "Indonesia Pacific",
-    31: "S Brazil Atlantic",
-    32: "Crozet / Kerguelen",
-    33: "Indian Ocean (Central)",
-    34: "S Indian Ocean (W)",
-    35: "Crozet Islands",
-    36: "S Atlantic (Mid-East)",
-    37: "S Atlantic (Main)",
-    38: "Tasman Sea / NZ",
-    39: "Peru Pacific",
-    40: "S Indian Ocean",
-    41: "SW Australian Coast",
-    42: "Tonga",
-    43: "NW Australia",
-    44: "Brazil Coast (N)",
-    45: "Argentine Atlantic",
-    46: "Chilean Coast (S)",
-    47: "Chilean Coast (N)",
-    48: "SE Pacific",
-    49: "Remote S Pacific",
-    50: "W Australian Coast",
-    51: "Great Australian Bight",
+    0:  "Hudson Bay",           1:  "Baja California",
+    2:  "Japan / Okhotsk",      3:  "Solomon Islands",
+    4:  "Gulf of Guinea",       5:  "S Atlantic (Tristan)",
+    6:  "Angola Atlantic",      7:  "Mid-Atlantic",
+    8:  "Hawaii Pacific",       9:  "Japan Sea",
+    10: "Brazil Atlantic",      11: "Equatorial Pacific",
+    12: "Caribbean",            13: "Gulf of Alaska",
+    14: "Madagascar",           15: "E Africa Indian Ocean",
+    16: "Gulf of Mexico",       17: "US East Coast",
+    18: "N Atlantic (Azores)",  19: "Equatorial Atlantic",
+    20: "N Pacific (Kamchatka)",21: "Bering Sea (West)",
+    22: "Western Arctic",       23: "Bering Strait",
+    24: "Cape Verde (S)",       25: "Cape Verde (N)",
+    26: "Kamchatka / Okhotsk",  27: "Okhotsk Sea",
+    28: "Japan Ground (S)",     29: "Japan Ground (Main)",
+    30: "Indonesia Pacific",    31: "S Brazil Atlantic",
+    32: "Crozet / Kerguelen",   33: "Indian Ocean (Central)",
+    34: "S Indian Ocean (W)",   35: "Crozet Islands",
+    36: "S Atlantic (Mid-East)",37: "S Atlantic (Main)",
+    38: "Tasman Sea / NZ",      39: "Peru Pacific",
+    40: "S Indian Ocean",       41: "SW Australian Coast",
+    42: "Tonga",                43: "NW Australia",
+    44: "Brazil Coast (N)",     45: "Argentine Atlantic",
+    46: "Chilean Coast (S)",    47: "Chilean Coast (N)",
+    48: "SE Pacific",           49: "Remote S Pacific",
+    50: "W Australian Coast",   51: "Great Australian Bight",
 }
 
 RIG_MAP = {"Bark": 0, "Ship": 1, "Brig": 2, "Schr": 3, "Other": 4}
@@ -109,18 +84,12 @@ def parse_enc_count(json_str, key):
 
 
 def nearest_centroid(lats, lons, c_lats, c_lons):
-    """
-    Vectorized nearest-centroid by haversine proxy.
-    Returns integer index (0..51) of nearest centroid for each row.
-    Shape: lats/lons (n,), c_lats/c_lons (52,) → returns (n,) int array.
-    """
     lat1 = np.radians(lats[:, None])
     lon1 = np.radians(lons[:, None])
     lat2 = np.radians(c_lats[None, :])
     lon2 = np.radians(c_lons[None, :])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    a = (np.sin((lat2 - lat1) / 2) ** 2
+         + np.cos(lat1) * np.cos(lat2) * np.sin((lon2 - lon1) / 2) ** 2)
     return np.argmin(a, axis=1)
 
 
@@ -136,7 +105,6 @@ def build_features(con):
              AND Lat BETWEEN -90 AND 90""",
         con,
     ).reset_index(drop=True)
-    # Fix antimeridian
     df.loc[df["Lon"] < -180, "Lon"] += 360
     df = df[df["Lon"].between(-180, 180)].reset_index(drop=True)
     n0 = len(df)
@@ -150,32 +118,26 @@ def build_features(con):
     )
     c_lats = centroids["lat_centroid"].values
     c_lons = centroids["lon_centroid"].values
-    c_ids  = centroids["cluster"].values      # should be 0..51
+    c_ids  = centroids["cluster"].values
 
-    ground_id = df["cluster_active"].fillna(-1).astype(int).values.copy()
+    ground_id     = df["cluster_active"].fillna(-1).astype(int).values.copy()
     need_centroid = ground_id < 0
-    print(f"    Direct ground: {(~need_centroid).sum():,}  "
-          f"Nearest centroid: {need_centroid.sum():,}")
-
-    # Nearest centroid for unassigned rows
     nc_idx = nearest_centroid(
         df.loc[need_centroid, "Lat"].values,
         df.loc[need_centroid, "Lon"].values,
         c_lats, c_lons,
     )
     ground_id[need_centroid] = c_ids[nc_idx]
-    df["ground_id"] = ground_id
+    df["ground_id"]    = ground_id
     df["ground_label"] = df["ground_id"].map(GROUND_LABELS)
+    print(f"    Direct: {(~need_centroid).sum():,}  Nearest centroid: {need_centroid.sum():,}")
 
     ground_dummies = pd.get_dummies(df["ground_label"], prefix="gnd")
-    # Ensure all 52 columns present (some may be absent if split unlucky)
     for lbl in GROUND_LABELS.values():
         col = f"gnd_{lbl}"
         if col not in ground_dummies.columns:
             ground_dummies[col] = 0
-    ground_dummies = ground_dummies.reindex(
-        sorted(ground_dummies.columns), axis=1
-    )
+    ground_dummies = ground_dummies.reindex(sorted(ground_dummies.columns), axis=1)
 
     # ── Fleet events ──────────────────────────────────────────────────────────
     print("  Joining fleet features ...")
@@ -191,7 +153,6 @@ def build_features(con):
                              "duration_days": "fleet_duration_days"})
     fe = fe[["cluster_fleet", "fleet_n_vessels", "fleet_duration_days",
              "fleet_sight_count", "fleet_spoke_count"]]
-
     df = df.merge(fe, on="cluster_fleet", how="left")
     assert len(df) == n0
     for col in ["fleet_n_vessels", "fleet_duration_days",
@@ -257,25 +218,43 @@ def build_features(con):
 
     y      = df["y"].values
     groups = df["VoyageID"].values
+    print(f"  Feature matrix: {X.shape[0]:,} × {X.shape[1]} columns  "
+          f"(Strike rate: {y.mean():.1%})")
+    return df, X, y, groups, base_cols
 
-    print(f"  Feature matrix: {X.shape[0]:,} × {X.shape[1]} columns")
-    print(f"  Positive rate (Strike): {y.mean():.1%}")
-    return df, X, y, groups
 
+# ── Split and save partitions ─────────────────────────────────────────────────
 
-# ── Train / evaluate ──────────────────────────────────────────────────────────
-
-def train_evaluate(df, X, y, groups):
+def split_and_save(df, X, y, groups, base_cols):
     print("\nSplitting 80/20 by VoyageID ...")
     gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
     train_idx, test_idx = next(gss.split(X, y, groups=groups))
+    print(f"  Train: {len(train_idx):,}  Test: {len(test_idx):,}")
 
-    X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-    y_train, y_test = y[train_idx],      y[test_idx]
-    print(f"  Train: {len(X_train):,}  Test: {len(X_test):,}")
-    print(f"  Train +rate: {y_train.mean():.1%}  Test +rate: {y_test.mean():.1%}")
+    export_cols = (
+        ["VoyageID", "vessel", "Year", "Month", "Encounter",
+         "Lat", "Lon", "ground_label", "rig", "tonnage"]
+        + base_cols
+        + ["y"]
+    )
 
-    print("\nTraining RandomForest (500 trees, class_weight=balanced) ...")
+    train_csv = os.path.join(OUTPUT_DIR, "rf_train_80pct.csv")
+    test_csv  = os.path.join(OUTPUT_DIR, "rf_test_20pct.csv")
+
+    df.iloc[train_idx][export_cols].to_csv(train_csv, index=False)
+    df.iloc[test_idx][export_cols].to_csv(test_csv,  index=False)
+    print(f"  Train partition → {train_csv}")
+    print(f"  Test partition  → {test_csv}  (reserved for regression)")
+
+    return train_idx, test_idx
+
+
+# ── Train ─────────────────────────────────────────────────────────────────────
+
+def train(X, y, train_idx):
+    X_train = X.iloc[train_idx]
+    y_train = y[train_idx]
+    print("\nTraining RandomForest on 80% partition ...")
     rf = RandomForestClassifier(
         n_estimators=500,
         max_features="sqrt",
@@ -285,64 +264,20 @@ def train_evaluate(df, X, y, groups):
         random_state=42,
     )
     rf.fit(X_train, y_train)
-
-    y_prob = rf.predict_proba(X_test)[:, 1]
-    y_pred = (y_prob >= 0.5).astype(int)
-
-    auroc = roc_auc_score(y_test, y_prob)
-    f1    = f1_score(y_test, y_pred)
-    print(f"\n  AUROC : {auroc:.4f}")
-    print(f"  F1    : {f1:.4f}")
-
-    return rf, X_train, X_test, y_train, y_test, y_prob, train_idx, test_idx, auroc, f1
+    train_auroc = roc_auc_score(y_train, rf.predict_proba(X_train)[:, 1])
+    print(f"  Train AUROC (sanity): {train_auroc:.4f}")
+    return rf, X_train, y_train, train_auroc
 
 
-def auroc_by_decade(df, test_idx, y_test, y_prob):
-    years   = df.iloc[test_idx]["Year"].values
-    decades = (years // 10) * 10
-    results = {}
-    for dec in sorted(set(decades)):
-        mask = decades == dec
-        if mask.sum() < 50 or y_test[mask].sum() < 5:
-            continue
-        try:
-            results[int(dec)] = roc_auc_score(y_test[mask], y_prob[mask])
-        except Exception:
-            pass
-    print("\n  AUROC by decade:")
-    for dec, auc in results.items():
-        print(f"    {dec}s: {auc:.3f}  (n={int((decades == dec).sum())})")
-    return results
+# ── Feature importance ────────────────────────────────────────────────────────
 
-
-# ── Plots ─────────────────────────────────────────────────────────────────────
-
-def plot_precision_recall(y_test, y_prob, outfile):
-    precision, recall, _ = precision_recall_curve(y_test, y_prob)
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(recall, precision, lw=1.5, color="steelblue")
-    ax.axhline(y_test.mean(), color="gray", linestyle="--",
-               label=f"Baseline ({y_test.mean():.2f})")
-    ax.set_xlabel("Recall")
-    ax.set_ylabel("Precision")
-    ax.set_title("Precision–Recall Curve (Strike class)")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(outfile, dpi=150)
-    plt.close(fig)
-    print(f"  PR curve → {outfile}")
-
-
-def plot_feature_importance(rf, X_test, y_test, outfile):
-    print("  Computing permutation importance (n_repeats=5) ...")
+def plot_feature_importance(rf, X_train, y_train, outfile):
+    print("  Computing permutation importance on training set ...")
     result = permutation_importance(
-        rf, X_test, y_test,
-        n_repeats=5,
-        random_state=42,
-        n_jobs=-1,
-        scoring="roc_auc",
+        rf, X_train, y_train,
+        n_repeats=5, random_state=42, n_jobs=-1, scoring="roc_auc",
     )
-    names    = list(X_test.columns)
+    names    = list(X_train.columns)
     imp_mean = result.importances_mean
     imp_std  = result.importances_std
 
@@ -358,13 +293,64 @@ def plot_feature_importance(rf, X_test, y_test, outfile):
     ax.set_yticks(y_pos)
     ax.set_yticklabels(top_names[::-1], fontsize=9)
     ax.set_xlabel("Permutation importance (AUROC drop)")
-    ax.set_title("Top 25 Feature Importances")
+    ax.set_title("Feature Importance — Training Set")
     fig.tight_layout()
     fig.savefig(outfile, dpi=150)
     plt.close(fig)
-    print(f"  Feature importance → {outfile}")
-
+    print(f"  FI plot → {outfile}")
     return dict(zip(names, imp_mean.tolist()))
+
+
+# ── SHAP ──────────────────────────────────────────────────────────────────────
+
+def compute_shap(rf, X_train, outfile_summary, outfile_interact):
+    print("  Computing SHAP values (sample=5,000 rows) ...")
+    rng     = np.random.default_rng(42)
+    idx     = rng.choice(len(X_train), min(5000, len(X_train)), replace=False)
+    X_sample = X_train.iloc[idx]
+
+    explainer   = shap.TreeExplainer(rf)
+    shap_values = explainer.shap_values(X_sample)
+
+    # shap_values is list [class0, class1] for classifiers
+    sv = shap_values[1] if isinstance(shap_values, list) else shap_values
+
+    # ── Beeswarm summary ─────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 9))
+    shap.summary_plot(sv, X_sample, show=False, max_display=25,
+                      plot_size=None)
+    plt.title("SHAP Summary — Direction of Contribution (Strike)")
+    plt.tight_layout()
+    fig.savefig(outfile_summary, dpi=150, bbox_inches="tight")
+    plt.close("all")
+    print(f"  SHAP summary → {outfile_summary}")
+
+    # ── Interaction heatmap ───────────────────────────────────────────────────
+    print("  Computing SHAP interaction values (top features) ...")
+    # Use top 10 features by mean |SHAP| for interaction matrix
+    mean_abs = np.abs(sv).mean(axis=0)
+    top10    = np.argsort(mean_abs)[::-1][:10]
+    top_names = [X_sample.columns[i] for i in top10]
+    sv_top   = sv[:, top10]
+
+    # Approximate interaction: correlation of SHAP values between feature pairs
+    corr = np.corrcoef(sv_top.T)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r")
+    ax.set_xticks(range(10))
+    ax.set_yticks(range(10))
+    ax.set_xticklabels(top_names, rotation=45, ha="right", fontsize=8)
+    ax.set_yticklabels(top_names, fontsize=8)
+    plt.colorbar(im, ax=ax, label="SHAP value correlation")
+    ax.set_title("Feature Interaction Map (SHAP correlation, top 10 features)")
+    fig.tight_layout()
+    fig.savefig(outfile_interact, dpi=150)
+    plt.close(fig)
+    print(f"  Interaction map → {outfile_interact}")
+
+    # Mean SHAP per feature (direction of contribution)
+    mean_shap = dict(zip(X_train.columns.tolist(), sv.mean(axis=0).tolist()))
+    return mean_shap
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -372,46 +358,34 @@ def plot_feature_importance(rf, X_test, y_test, outfile):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
-
-    df, X, y, groups = build_features(con)
+    df, X, y, groups, base_cols = build_features(con)
     con.close()
 
-    rf, X_train, X_test, y_train, y_test, y_prob, \
-        train_idx, test_idx, auroc, f1 = train_evaluate(df, X, y, groups)
+    train_idx, test_idx = split_and_save(df, X, y, groups, base_cols)
 
-    decade_auroc = auroc_by_decade(df, test_idx, y_test, y_prob)
+    rf, X_train, y_train, train_auroc = train(X, y, train_idx)
 
-    print("\nGenerating plots ...")
-    plot_precision_recall(y_test, y_prob,
-                          os.path.join(OUTPUT_DIR, "pr_curve.png"))
+    print("\nGenerating exploration outputs ...")
     feat_imp = plot_feature_importance(
-        rf, X_test, y_test,
+        rf, X_train, y_train,
         os.path.join(OUTPUT_DIR, "feature_importance.png"),
     )
-
-    # ── Save test set predictions ─────────────────────────────────────────────
-    print("\nSaving test set CSV ...")
-    test_df = df.iloc[test_idx][
-        ["VoyageID", "vessel", "Year", "Month", "Encounter",
-         "Lat", "Lon", "ground_label", "rig", "tonnage"]
-    ].copy()
-    test_df["y_true"] = y_test
-    test_df["y_prob"] = y_prob.round(4)
-    test_df["y_pred"] = (y_prob >= 0.5).astype(int)
-    test_csv = os.path.join(OUTPUT_DIR, "rf_test_predictions.csv")
-    test_df.to_csv(test_csv, index=False)
-    print(f"  Test predictions → {test_csv}  ({len(test_df):,} rows)")
+    mean_shap = compute_shap(
+        rf, X_train,
+        os.path.join(OUTPUT_DIR, "shap_summary.png"),
+        os.path.join(OUTPUT_DIR, "shap_interactions.png"),
+    )
 
     meta = {
-        "n_rows":        int(len(df)),
-        "n_train":       int(len(X_train)),
-        "n_test":        int(len(X_test)),
+        "n_total":       int(len(df)),
+        "n_train":       int(len(train_idx)),
+        "n_test":        int(len(test_idx)),
         "positive_rate": float(y.mean()),
-        "auroc":         float(auroc),
-        "f1":            float(f1),
-        "decade_auroc":  {str(k): round(float(v), 4) for k, v in decade_auroc.items()},
-        "top_features":  {k: round(v, 6) for k, v in
-                          sorted(feat_imp.items(), key=lambda x: -x[1])[:30]},
+        "train_auroc":   float(train_auroc),
+        "top_features_fi": {k: round(v, 6) for k, v in
+                             sorted(feat_imp.items(), key=lambda x: -x[1])[:30]},
+        "shap_direction": {k: round(v, 6) for k, v in
+                           sorted(mean_shap.items(), key=lambda x: -abs(x[1]))[:30]},
     }
     meta_path = os.path.join(OUTPUT_DIR, "rf_metadata.json")
     with open(meta_path, "w") as f:
