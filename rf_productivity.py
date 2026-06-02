@@ -129,7 +129,7 @@ def nearest_centroid(lats, lons, c_lats, c_lons):
 def build_features(con):
     print("Loading all valid observations ...")
     df = pd.read_sql_query(
-        """SELECT id, VoyageID, cluster_active, cluster_fleet,
+        """SELECT id, VoyageID, vessel, cluster_active, cluster_fleet,
                   Encounter, Year, Month, Lat, Lon, rig, tonnage
            FROM observations
            WHERE Lat IS NOT NULL AND Lon IS NOT NULL AND Year IS NOT NULL
@@ -388,6 +388,19 @@ def main():
         rf, X_test, y_test,
         os.path.join(OUTPUT_DIR, "feature_importance.png"),
     )
+
+    # ── Save test set predictions ─────────────────────────────────────────────
+    print("\nSaving test set CSV ...")
+    test_df = df.iloc[test_idx][
+        ["VoyageID", "vessel", "Year", "Month", "Encounter",
+         "Lat", "Lon", "ground_label", "rig", "tonnage"]
+    ].copy()
+    test_df["y_true"] = y_test
+    test_df["y_prob"] = y_prob.round(4)
+    test_df["y_pred"] = (y_prob >= 0.5).astype(int)
+    test_csv = os.path.join(OUTPUT_DIR, "rf_test_predictions.csv")
+    test_df.to_csv(test_csv, index=False)
+    print(f"  Test predictions → {test_csv}  ({len(test_df):,} rows)")
 
     meta = {
         "n_rows":        int(len(df)),
