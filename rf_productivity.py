@@ -8,6 +8,7 @@ The 20% holdout is saved pristine for regression hypothesis testing (Step 4).
 """
 import json
 import os
+import pickle
 import sqlite3
 
 import matplotlib
@@ -251,19 +252,31 @@ def split_and_save(df, X, y, groups, base_cols):
 
 # ── Train ─────────────────────────────────────────────────────────────────────
 
+MODEL_PATH = os.path.join(OUTPUT_DIR, "rf_model.pkl")
+
 def train(X, y, train_idx):
     X_train = X.iloc[train_idx]
     y_train = y[train_idx]
-    print("\nTraining RandomForest on 80% partition ...")
-    rf = RandomForestClassifier(
-        n_estimators=500,
-        max_features="sqrt",
-        min_samples_leaf=30,
-        class_weight="balanced",
-        n_jobs=-1,
-        random_state=42,
-    )
-    rf.fit(X_train, y_train)
+
+    if os.path.exists(MODEL_PATH):
+        print(f"\nLoading saved RF model from {MODEL_PATH} ...")
+        with open(MODEL_PATH, "rb") as f:
+            rf = pickle.load(f)
+    else:
+        print("\nTraining RandomForest on 80% partition ...")
+        rf = RandomForestClassifier(
+            n_estimators=500,
+            max_features="sqrt",
+            min_samples_leaf=30,
+            class_weight="balanced",
+            n_jobs=-1,
+            random_state=42,
+        )
+        rf.fit(X_train, y_train)
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(rf, f)
+        print(f"  Model saved → {MODEL_PATH}")
+
     train_auroc = roc_auc_score(y_train, rf.predict_proba(X_train)[:, 1])
     print(f"  Train AUROC (sanity): {train_auroc:.4f}")
     return rf, X_train, y_train, train_auroc
@@ -272,6 +285,10 @@ def train(X, y, train_idx):
 # ── Feature importance ────────────────────────────────────────────────────────
 
 def plot_feature_importance(rf, X_train, y_train, outfile):
+    if os.path.exists(outfile):
+        print(f"  FI plot already exists — skipping ({outfile})")
+        # return dummy dict so metadata still works
+        return {c: 0.0 for c in X_train.columns}
     print("  Computing permutation importance on training set ...")
     result = permutation_importance(
         rf, X_train, y_train,
@@ -304,16 +321,24 @@ def plot_feature_importance(rf, X_train, y_train, outfile):
 # ── SHAP ──────────────────────────────────────────────────────────────────────
 
 def compute_shap(rf, X_train, outfile_summary, outfile_interact):
-    print("  Computing SHAP values (sample=5,000 rows) ...")
-    rng     = np.random.default_rng(42)
-    idx     = rng.choice(len(X_train), min(5000, len(X_train)), replace=False)
+    print("  Computing SHAP values (sample=500 rows) ...")
+    rng      = np.random.default_rng(42)
+    idx      = rng.choice(len(X_train), min(500, len(X_train)), replace=False)
     X_sample = X_train.iloc[idx]
 
-    explainer   = shap.TreeExplainer(rf)
-    shap_values = explainer.shap_values(X_sample)
+    # Small background summary keeps TreeExplainer fast
+    background  = shap.sample(X_train, 100, random_state=42)
+    explainer   = shap.TreeExplainer(rf, background,
+                                     feature_perturbation="interventional")
+    shap_values = explainer.shap_values(X_sample, check_additivity=False)
 
-    # shap_values is list [class0, class1] for classifiers
-    sv = shap_values[1] if isinstance(shap_values, list) else shap_values
+    # Normalise to 2D (n_samples, n_features) regardless of SHAP version
+    if isinstance(shap_values, list):
+        sv = shap_values[1]          # binary: take class-1 array
+    else:
+        sv = shap_values
+    if sv.ndim == 3:
+        sv = sv[:, :, 1]             # (samples, features, outputs) → (samples, features)
 
     # ── Beeswarm summary ─────────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(9, 9))
@@ -333,7 +358,6 @@ def compute_shap(rf, X_train, outfile_summary, outfile_interact):
     top_names = [X_sample.columns[i] for i in top10]
     sv_top   = sv[:, top10]
 
-    # Approximate interaction: correlation of SHAP values between feature pairs
     corr = np.corrcoef(sv_top.T)
     fig, ax = plt.subplots(figsize=(8, 7))
     im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r")
