@@ -171,21 +171,25 @@ def build_features(con):
     df["arrival_rank"] = df["arrival_rank"].fillna(0).astype(int)
     df["is_leader"]    = (df["arrival_rank"] == 1).astype(int)
 
-    # ── Convoys ───────────────────────────────────────────────────────────────
-    conv = pd.read_sql_query(
-        """SELECT voyage_a AS VoyageID, n_consecutive_days FROM fleet_convoys
-           UNION ALL
-           SELECT voyage_b, n_consecutive_days FROM fleet_convoys""",
-        con,
+    # ── Vessel-level fleet metrics ────────────────────────────────────────────
+    voyage_fleet = df.groupby("VoyageID").agg(
+        total_days=("cluster_fleet", "count"),
+        days_in_fleet=("cluster_fleet", lambda x: (x != -1).sum()),
+        n_clusters_visited=("cluster_fleet", lambda x: x[x != -1].nunique()),
+    ).reset_index()
+    voyage_fleet["days_outside_cluster"] = (
+        voyage_fleet["total_days"] - voyage_fleet["days_in_fleet"])
+    voyage_fleet["pct_days_in_fleet"] = (
+        voyage_fleet["days_in_fleet"] / voyage_fleet["total_days"])
+    df = df.merge(
+        voyage_fleet[["VoyageID", "n_clusters_visited",
+                       "pct_days_in_fleet", "days_outside_cluster"]],
+        on="VoyageID", how="left",
     )
-    conv_agg = (conv.groupby("VoyageID")["n_consecutive_days"]
-                .max().reset_index()
-                .rename(columns={"n_consecutive_days": "convoy_max_days"}))
-    conv_agg["convoy_member"] = 1
-    df = df.merge(conv_agg, on="VoyageID", how="left")
     assert len(df) == n0
-    df["convoy_member"]   = df["convoy_member"].fillna(0).astype(int)
-    df["convoy_max_days"] = df["convoy_max_days"].fillna(0).astype(int)
+    df["n_clusters_visited"]   = df["n_clusters_visited"].fillna(0).astype(int)
+    df["pct_days_in_fleet"]    = df["pct_days_in_fleet"].fillna(0.0)
+    df["days_outside_cluster"] = df["days_outside_cluster"].fillna(0).astype(int)
 
     # ── Voyage has spoke ──────────────────────────────────────────────────────
     spoke_vids = set(pd.read_sql_query(
@@ -208,7 +212,7 @@ def build_features(con):
         "in_fleet_event", "fleet_n_vessels", "fleet_duration_days",
         "fleet_sight_count", "fleet_spoke_count",
         "arrival_rank", "is_leader",
-        "convoy_member", "convoy_max_days",
+        "n_clusters_visited", "pct_days_in_fleet", "days_outside_cluster",
         "voyage_has_spoke",
     ]
     X = pd.concat(
@@ -232,10 +236,10 @@ def split_and_save(df, X, y, groups, base_cols):
     train_idx, test_idx = next(gss.split(X, y, groups=groups))
     print(f"  Train: {len(train_idx):,}  Test: {len(test_idx):,}")
 
-    # base_cols already contains Year and Month; avoid duplicate column names
-    meta_cols   = ["VoyageID", "vessel", "Encounter", "Lat", "Lon",
-                   "ground_label", "rig", "tonnage"]
-    export_cols = meta_cols + base_cols + ["y"]
+    export_cols = (
+        ["VoyageID", "vessel", "Encounter", "Lat", "Lon", "ground_label", "rig", "tonnage"]
+        + base_cols + ["y"]
+    )
 
     train_csv = os.path.join(OUTPUT_DIR, "rf_train_80pct.csv")
     test_csv  = os.path.join(OUTPUT_DIR, "rf_test_20pct.csv")
@@ -284,8 +288,8 @@ def train(X, y, train_idx):
 
 def plot_feature_importance(rf, X_train, y_train, outfile):
     cache = outfile.replace(".png", "_values.json")
-    if os.path.exists(outfile) and os.path.exists(cache):
-        print(f"  FI plot already exists — loading cached values ({cache})")
+    if os.path.exists(cache):
+        print(f"  Loading cached FI values ({cache})")
         with open(cache) as f:
             return json.load(f)
     print("  Computing permutation importance on training set ...")
