@@ -6,12 +6,11 @@ The RF is an exploration engine, not a prediction tool. Feature importance
 is computed on the 80% training partition only.
 The 20% holdout is saved pristine for regression hypothesis testing (Step 4).
 
-Features (63 total = 11 base + 52 ground dummies):
+Features (60 total = 8 base + 52 ground dummies):
   Time:    Year, Month
   Vessel:  rig_enc, tonnage_num
   Social:  in_fleet_event, fleet_n_vessels, fleet_duration_days,
-           voyage_has_spoke, n_clusters_visited, pct_days_in_fleet,
-           days_outside_cluster
+           voyage_has_spoke
   Location: 52 gnd_* dummies
 """
 import json
@@ -152,26 +151,6 @@ def build_features(con):
     df["fleet_duration_days"] = df["fleet_duration_days"].fillna(0)
     df["in_fleet_event"]      = (df["fleet_n_vessels"] >= 2).astype(int)
 
-    # ── Vessel-level fleet metrics ────────────────────────────────────────────
-    voyage_fleet = df.groupby("VoyageID").agg(
-        total_days=("cluster_fleet", "count"),
-        days_in_fleet=("cluster_fleet", lambda x: (x != -1).sum()),
-        n_clusters_visited=("cluster_fleet", lambda x: x[x != -1].nunique()),
-    ).reset_index()
-    voyage_fleet["days_outside_cluster"] = (
-        voyage_fleet["total_days"] - voyage_fleet["days_in_fleet"])
-    voyage_fleet["pct_days_in_fleet"] = (
-        voyage_fleet["days_in_fleet"] / voyage_fleet["total_days"])
-    df = df.merge(
-        voyage_fleet[["VoyageID", "n_clusters_visited",
-                       "pct_days_in_fleet", "days_outside_cluster"]],
-        on="VoyageID", how="left",
-    )
-    assert len(df) == n0
-    df["n_clusters_visited"]   = df["n_clusters_visited"].fillna(0).astype(int)
-    df["pct_days_in_fleet"]    = df["pct_days_in_fleet"].fillna(0.0)
-    df["days_outside_cluster"] = df["days_outside_cluster"].fillna(0).astype(int)
-
     # ── Voyage has spoke ──────────────────────────────────────────────────────
     spoke_vids = set(pd.read_sql_query(
         "SELECT DISTINCT VoyageID FROM observations WHERE Encounter='Spoke'", con
@@ -192,7 +171,6 @@ def build_features(con):
         "rig_enc", "tonnage_num",
         "in_fleet_event", "fleet_n_vessels", "fleet_duration_days",
         "voyage_has_spoke",
-        "n_clusters_visited", "pct_days_in_fleet", "days_outside_cluster",
     ]
     X = pd.concat(
         [df[base_cols].reset_index(drop=True),
