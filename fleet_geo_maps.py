@@ -73,7 +73,7 @@ def plot_fleet_map(fleet, land):
     print(f"  Removed {removed} mainland centroids → {len(ocean_fleet):,} ocean events")
 
     vmin, vmax = 2, ocean_fleet['n_vessels'].max()
-    norm = mcolors.LogNorm(vmin=vmin, vmax=vmax)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
     cmap = plt.colormaps['plasma']
     sizes = np.clip(ocean_fleet['n_obs'] * 1.5, 8, 120)
 
@@ -106,7 +106,7 @@ def plot_fleet_map(fleet, land):
         ax.scatter(
             val['centroid_lon'], val['centroid_lat'],
             marker='*', s=45, color='#007700', alpha=0.9,
-            label=f'Spoke-validated ({len(val)})',
+            label='Spoke-validated',
             transform=ccrs.PlateCarree(), zorder=6
         )
         ax.legend(loc='lower left', framealpha=0.8, fontsize=9,
@@ -118,11 +118,7 @@ def plot_fleet_map(fleet, land):
     cb.ax.tick_params(labelsize=8, color='#333333')
     plt.setp(cb.ax.yaxis.get_ticklabels(), color='#333333')
 
-    ax.set_title(
-        f'Fleet-in-Company Events  ·  {len(ocean_fleet):,} ocean clusters  ·  '
-        f'up to {int(ocean_fleet["n_vessels"].max())} vessels co-located',
-        fontsize=13, color='#222222', pad=14
-    )
+    ax.set_title('Fleet-in-Company Events', fontsize=13, color='#222222', pad=14)
 
     out = os.path.join(OUTPUT_DIR, 'fleet_map_static.png')
     fig.savefig(out, dpi=150, bbox_inches='tight', facecolor='white')
