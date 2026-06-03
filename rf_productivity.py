@@ -232,12 +232,10 @@ def split_and_save(df, X, y, groups, base_cols):
     train_idx, test_idx = next(gss.split(X, y, groups=groups))
     print(f"  Train: {len(train_idx):,}  Test: {len(test_idx):,}")
 
-    export_cols = (
-        ["VoyageID", "vessel", "Year", "Month", "Encounter",
-         "Lat", "Lon", "ground_label", "rig", "tonnage"]
-        + base_cols
-        + ["y"]
-    )
+    # base_cols already contains Year and Month; avoid duplicate column names
+    meta_cols   = ["VoyageID", "vessel", "Encounter", "Lat", "Lon",
+                   "ground_label", "rig", "tonnage"]
+    export_cols = meta_cols + base_cols + ["y"]
 
     train_csv = os.path.join(OUTPUT_DIR, "rf_train_80pct.csv")
     test_csv  = os.path.join(OUTPUT_DIR, "rf_test_20pct.csv")
@@ -285,10 +283,11 @@ def train(X, y, train_idx):
 # ── Feature importance ────────────────────────────────────────────────────────
 
 def plot_feature_importance(rf, X_train, y_train, outfile):
-    if os.path.exists(outfile):
-        print(f"  FI plot already exists — skipping ({outfile})")
-        # return dummy dict so metadata still works
-        return {c: 0.0 for c in X_train.columns}
+    cache = outfile.replace(".png", "_values.json")
+    if os.path.exists(outfile) and os.path.exists(cache):
+        print(f"  FI plot already exists — loading cached values ({cache})")
+        with open(cache) as f:
+            return json.load(f)
     print("  Computing permutation importance on training set ...")
     result = permutation_importance(
         rf, X_train, y_train,
@@ -314,8 +313,11 @@ def plot_feature_importance(rf, X_train, y_train, outfile):
     fig.tight_layout()
     fig.savefig(outfile, dpi=150)
     plt.close(fig)
+    fi_dict = dict(zip(names, imp_mean.tolist()))
+    with open(cache, "w") as f:
+        json.dump(fi_dict, f, indent=2)
     print(f"  FI plot → {outfile}")
-    return dict(zip(names, imp_mean.tolist()))
+    return fi_dict
 
 
 # ── SHAP ──────────────────────────────────────────────────────────────────────
