@@ -143,53 +143,16 @@ def build_features(con):
     # ── Fleet events ──────────────────────────────────────────────────────────
     print("  Joining fleet features ...")
     fe = pd.read_sql_query(
-        "SELECT cluster_fleet, n_vessels, duration_days, encounter_types FROM fleet_events",
+        "SELECT cluster_fleet, n_vessels, duration_days FROM fleet_events",
         con,
     )
-    fe["fleet_sight_count"] = fe["encounter_types"].apply(
-        lambda x: parse_enc_count(x, "Sight"))
-    fe["fleet_spoke_count"] = fe["encounter_types"].apply(
-        lambda x: parse_enc_count(x, "Spoke"))
     fe = fe.rename(columns={"n_vessels": "fleet_n_vessels",
                              "duration_days": "fleet_duration_days"})
-    fe = fe[["cluster_fleet", "fleet_n_vessels", "fleet_duration_days",
-             "fleet_sight_count", "fleet_spoke_count"]]
     df = df.merge(fe, on="cluster_fleet", how="left")
     assert len(df) == n0
-    for col in ["fleet_n_vessels", "fleet_duration_days",
-                "fleet_sight_count", "fleet_spoke_count"]:
-        df[col] = df[col].fillna(0)
-    df["in_fleet_event"] = (df["fleet_n_vessels"] >= 2).astype(int)
-
-    # ── Leader / follower ─────────────────────────────────────────────────────
-    lf = pd.read_sql_query(
-        "SELECT cluster_fleet, voyageID AS VoyageID, arrival_rank FROM leader_follower",
-        con,
-    )
-    df = df.merge(lf, on=["cluster_fleet", "VoyageID"], how="left")
-    assert len(df) == n0
-    df["arrival_rank"] = df["arrival_rank"].fillna(0).astype(int)
-    df["is_leader"]    = (df["arrival_rank"] == 1).astype(int)
-
-    # ── Vessel-level fleet metrics ────────────────────────────────────────────
-    voyage_fleet = df.groupby("VoyageID").agg(
-        total_days=("cluster_fleet", "count"),
-        days_in_fleet=("cluster_fleet", lambda x: (x != -1).sum()),
-        n_clusters_visited=("cluster_fleet", lambda x: x[x != -1].nunique()),
-    ).reset_index()
-    voyage_fleet["days_outside_cluster"] = (
-        voyage_fleet["total_days"] - voyage_fleet["days_in_fleet"])
-    voyage_fleet["pct_days_in_fleet"] = (
-        voyage_fleet["days_in_fleet"] / voyage_fleet["total_days"])
-    df = df.merge(
-        voyage_fleet[["VoyageID", "n_clusters_visited",
-                       "pct_days_in_fleet", "days_outside_cluster"]],
-        on="VoyageID", how="left",
-    )
-    assert len(df) == n0
-    df["n_clusters_visited"]   = df["n_clusters_visited"].fillna(0).astype(int)
-    df["pct_days_in_fleet"]    = df["pct_days_in_fleet"].fillna(0.0)
-    df["days_outside_cluster"] = df["days_outside_cluster"].fillna(0).astype(int)
+    df["fleet_n_vessels"]    = df["fleet_n_vessels"].fillna(0)
+    df["fleet_duration_days"] = df["fleet_duration_days"].fillna(0)
+    df["in_fleet_event"]     = (df["fleet_n_vessels"] >= 2).astype(int)
 
     # ── Voyage has spoke ──────────────────────────────────────────────────────
     spoke_vids = set(pd.read_sql_query(
@@ -207,12 +170,9 @@ def build_features(con):
 
     # ── Assemble X ───────────────────────────────────────────────────────────
     base_cols = [
-        "Year", "Month",
+        "Year",
         "rig_enc", "tonnage_num",
         "in_fleet_event", "fleet_n_vessels", "fleet_duration_days",
-        "fleet_sight_count", "fleet_spoke_count",
-        "arrival_rank", "is_leader",
-        "n_clusters_visited", "pct_days_in_fleet", "days_outside_cluster",
         "voyage_has_spoke",
     ]
     X = pd.concat(
