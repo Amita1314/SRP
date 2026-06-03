@@ -5,8 +5,8 @@
   "year_km": 25.0,
   "season_km": 12.5,
   "n_rows": 85200,
-  "n_clusters": 52,
-  "noise_fraction": 0.1950117370892019,
-  "silhouette": 0.5120029449462891,
-  "davies_bouldin": 0.5423060671159405
+  "n_clusters": 57,
+  "noise_fraction": 0.23919014084507043,
+  "silhouette": 0.5219001173973083,
+  "davies_bouldin": 0.5270003385453921
 }

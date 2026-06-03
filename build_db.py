@@ -1,10 +1,10 @@
 import pandas as pd
 import sqlite3
 
-AOWL1   = "/root/.claude/uploads/f63912a1-c890-44b8-929f-fc612e2612cf/ccb7e463-aowl_20250916_part1.txt"
-AOWL2   = "/root/.claude/uploads/f63912a1-c890-44b8-929f-fc612e2612cf/3c96cfef-aowl_20250916_part2.txt"
-SPOKEN  = "/root/.claude/uploads/f63912a1-c890-44b8-929f-fc612e2612cf/ff389797-coml_spoken_download_20180104.txt"
-VOYAGES = "/root/.claude/uploads/f63912a1-c890-44b8-929f-fc612e2612cf/f524f41a-voyages_20240911.txt"
+AOWL1   = "/root/.claude/uploads/7cefc7e2-8b73-488a-accb-baa367c18d6c/27624691-aowl_20250916_part1.txt"
+AOWL2   = "/root/.claude/uploads/7cefc7e2-8b73-488a-accb-baa367c18d6c/25c666b3-aowl_20250916_part2.txt"
+SPOKEN  = "/root/.claude/uploads/7cefc7e2-8b73-488a-accb-baa367c18d6c/d6c91098-coml_spoken_download_20180104.txt"
+VOYAGES = "/root/.claude/uploads/7cefc7e2-8b73-488a-accb-baa367c18d6c/d157db60-voyages_20240911.txt"
 DB_PATH = "/home/user/SRP/whaling.db"
 
 # ── 1. ENCOUNTERS ──────────────────────────────────────────────────────────────
