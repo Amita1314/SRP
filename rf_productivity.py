@@ -271,10 +271,14 @@ def plot_feature_importance(rf, X_train, y_train, outfile):
         print(f"  Loading cached FI values ({cache})")
         with open(cache) as f:
             return json.load(f)
-    print("  Computing permutation importance on training set ...")
+    print("  Computing permutation importance on training set (50k subsample) ...")
+    rng = np.random.default_rng(42)
+    sub_idx = rng.choice(len(X_train), min(50_000, len(X_train)), replace=False)
+    X_sub = X_train.iloc[sub_idx]
+    y_sub = y_train[sub_idx]
     result = permutation_importance(
-        rf, X_train, y_train,
-        n_repeats=5, random_state=42, n_jobs=-1, scoring="roc_auc",
+        rf, X_sub, y_sub,
+        n_repeats=3, random_state=42, n_jobs=-1, scoring="roc_auc",
     )
     names    = list(X_train.columns)
     imp_mean = result.importances_mean
