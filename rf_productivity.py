@@ -2,9 +2,17 @@
 """
 rf_productivity.py — Random Forest: Inductive Exploration (Co-Duction Step 2)
 
-The RF is an exploration engine, not a prediction tool. All outputs (FI, SHAP
-direction, interaction effects) are computed on the 80% training partition only.
+The RF is an exploration engine, not a prediction tool. Feature importance
+is computed on the 80% training partition only.
 The 20% holdout is saved pristine for regression hypothesis testing (Step 4).
+
+Features (63 total = 11 base + 52 ground dummies):
+  Time:    Year, Month
+  Vessel:  rig_enc, tonnage_num
+  Social:  in_fleet_event, fleet_n_vessels, fleet_duration_days,
+           voyage_has_spoke, n_clusters_visited, pct_days_in_fleet,
+           days_outside_cluster
+  Location: 52 gnd_* dummies
 """
 import json
 import os
@@ -16,7 +24,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import shap
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import roc_auc_score
@@ -73,15 +80,6 @@ def clean_rig(s):
         return "Other"
     first = str(s).split("/")[0].split()[0].strip().title()
     return first if first in RIG_MAP else "Other"
-
-
-def parse_enc_count(json_str, key):
-    if pd.isna(json_str):
-        return 0
-    try:
-        return int(json.loads(json_str).get(key, 0))
-    except (ValueError, TypeError):
-        return 0
 
 
 def nearest_centroid(lats, lons, c_lats, c_lons):
@@ -150,9 +148,29 @@ def build_features(con):
                              "duration_days": "fleet_duration_days"})
     df = df.merge(fe, on="cluster_fleet", how="left")
     assert len(df) == n0
-    df["fleet_n_vessels"]    = df["fleet_n_vessels"].fillna(0)
+    df["fleet_n_vessels"]     = df["fleet_n_vessels"].fillna(0)
     df["fleet_duration_days"] = df["fleet_duration_days"].fillna(0)
-    df["in_fleet_event"]     = (df["fleet_n_vessels"] >= 2).astype(int)
+    df["in_fleet_event"]      = (df["fleet_n_vessels"] >= 2).astype(int)
+
+    # ── Vessel-level fleet metrics ────────────────────────────────────────────
+    voyage_fleet = df.groupby("VoyageID").agg(
+        total_days=("cluster_fleet", "count"),
+        days_in_fleet=("cluster_fleet", lambda x: (x != -1).sum()),
+        n_clusters_visited=("cluster_fleet", lambda x: x[x != -1].nunique()),
+    ).reset_index()
+    voyage_fleet["days_outside_cluster"] = (
+        voyage_fleet["total_days"] - voyage_fleet["days_in_fleet"])
+    voyage_fleet["pct_days_in_fleet"] = (
+        voyage_fleet["days_in_fleet"] / voyage_fleet["total_days"])
+    df = df.merge(
+        voyage_fleet[["VoyageID", "n_clusters_visited",
+                       "pct_days_in_fleet", "days_outside_cluster"]],
+        on="VoyageID", how="left",
+    )
+    assert len(df) == n0
+    df["n_clusters_visited"]   = df["n_clusters_visited"].fillna(0).astype(int)
+    df["pct_days_in_fleet"]    = df["pct_days_in_fleet"].fillna(0.0)
+    df["days_outside_cluster"] = df["days_outside_cluster"].fillna(0).astype(int)
 
     # ── Voyage has spoke ──────────────────────────────────────────────────────
     spoke_vids = set(pd.read_sql_query(
@@ -170,10 +188,11 @@ def build_features(con):
 
     # ── Assemble X ───────────────────────────────────────────────────────────
     base_cols = [
-        "Year",
+        "Year", "Month",
         "rig_enc", "tonnage_num",
         "in_fleet_event", "fleet_n_vessels", "fleet_duration_days",
         "voyage_has_spoke",
+        "n_clusters_visited", "pct_days_in_fleet", "days_outside_cluster",
     ]
     X = pd.concat(
         [df[base_cols].reset_index(drop=True),
@@ -284,65 +303,6 @@ def plot_feature_importance(rf, X_train, y_train, outfile):
     return fi_dict
 
 
-# ── SHAP ──────────────────────────────────────────────────────────────────────
-
-def compute_shap(rf, X_train, outfile_summary, outfile_interact):
-    print("  Computing SHAP values (sample=500 rows) ...")
-    rng      = np.random.default_rng(42)
-    idx      = rng.choice(len(X_train), min(500, len(X_train)), replace=False)
-    X_sample = X_train.iloc[idx]
-
-    # Small background summary keeps TreeExplainer fast
-    background  = shap.sample(X_train, 100, random_state=42)
-    explainer   = shap.TreeExplainer(rf, background,
-                                     feature_perturbation="interventional")
-    shap_values = explainer.shap_values(X_sample, check_additivity=False)
-
-    # Normalise to 2D (n_samples, n_features) regardless of SHAP version
-    if isinstance(shap_values, list):
-        sv = shap_values[1]          # binary: take class-1 array
-    else:
-        sv = shap_values
-    if sv.ndim == 3:
-        sv = sv[:, :, 1]             # (samples, features, outputs) → (samples, features)
-
-    # ── Beeswarm summary ─────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(9, 9))
-    shap.summary_plot(sv, X_sample, show=False, max_display=25,
-                      plot_size=None)
-    plt.title("SHAP Summary — Direction of Contribution (Strike)")
-    plt.tight_layout()
-    fig.savefig(outfile_summary, dpi=150, bbox_inches="tight")
-    plt.close("all")
-    print(f"  SHAP summary → {outfile_summary}")
-
-    # ── Interaction heatmap ───────────────────────────────────────────────────
-    print("  Computing SHAP interaction values (top features) ...")
-    # Use top 10 features by mean |SHAP| for interaction matrix
-    mean_abs = np.abs(sv).mean(axis=0)
-    top10    = np.argsort(mean_abs)[::-1][:10]
-    top_names = [X_sample.columns[i] for i in top10]
-    sv_top   = sv[:, top10]
-
-    corr = np.corrcoef(sv_top.T)
-    fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r")
-    ax.set_xticks(range(10))
-    ax.set_yticks(range(10))
-    ax.set_xticklabels(top_names, rotation=45, ha="right", fontsize=8)
-    ax.set_yticklabels(top_names, fontsize=8)
-    plt.colorbar(im, ax=ax, label="SHAP value correlation")
-    ax.set_title("Feature Interaction Map (SHAP correlation, top 10 features)")
-    fig.tight_layout()
-    fig.savefig(outfile_interact, dpi=150)
-    plt.close(fig)
-    print(f"  Interaction map → {outfile_interact}")
-
-    # Mean SHAP per feature (direction of contribution)
-    mean_shap = dict(zip(X_train.columns.tolist(), sv.mean(axis=0).tolist()))
-    return mean_shap
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -360,11 +320,6 @@ def main():
         rf, X_train, y_train,
         os.path.join(OUTPUT_DIR, "feature_importance.png"),
     )
-    mean_shap = compute_shap(
-        rf, X_train,
-        os.path.join(OUTPUT_DIR, "shap_summary.png"),
-        os.path.join(OUTPUT_DIR, "shap_interactions.png"),
-    )
 
     meta = {
         "n_total":       int(len(df)),
@@ -374,8 +329,6 @@ def main():
         "train_auroc":   float(train_auroc),
         "top_features_fi": {k: round(v, 6) for k, v in
                              sorted(feat_imp.items(), key=lambda x: -x[1])[:30]},
-        "shap_direction": {k: round(v, 6) for k, v in
-                           sorted(mean_shap.items(), key=lambda x: -abs(x[1]))[:30]},
     }
     meta_path = os.path.join(OUTPUT_DIR, "rf_metadata.json")
     with open(meta_path, "w") as f:
