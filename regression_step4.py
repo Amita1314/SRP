@@ -61,7 +61,8 @@ def build_matrix(df):
 def main():
     print(f"Loading test partition: {TEST_CSV}")
     df = pd.read_csv(TEST_CSV)
-    print(f"  {len(df):,} rows  |  Strike rate: {df['y'].mean():.3f}")
+    df = df[df["Encounter"] != "Spoke"].reset_index(drop=True)
+    print(f"  {len(df):,} rows (Spoke rows excluded)  |  Strike rate: {df['y'].mean():.3f}")
     print(f"  Voyages: {df['VoyageID'].nunique():,}")
 
     X, ref_ground = build_matrix(df)

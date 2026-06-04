@@ -163,7 +163,13 @@ def build_features(con):
     df["rig_enc"]     = df["rig"].apply(clean_rig).map(RIG_MAP)
 
     # ── Target ───────────────────────────────────────────────────────────────
+    # Drop Spoke rows: they are y=0 but have voyage_has_spoke=1 by construction,
+    # which creates spurious negative association. Model is Strike vs NoEnc+Sight.
+    df = df[df["Encounter"] != "Spoke"].reset_index(drop=True)
+    ground_dummies = ground_dummies.loc[df.index].reset_index(drop=True)
     df["y"] = (df["Encounter"] == "Strike").astype(int)
+    n_spoke_dropped = n0 - len(df)
+    print(f"  Spoke rows dropped: {n_spoke_dropped:,} → {len(df):,} rows remaining")
 
     # ── Assemble X ───────────────────────────────────────────────────────────
     base_cols = [
